@@ -1,0 +1,252 @@
+---
+title: "Vickers-Relative-risk-of-PCa-Death-by-Baseline-Risk-SPCG4-Cohort"
+subtitle: "Initial Setup"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Raw Data Import
+
+```{r import, include = FALSE}
+
+# load libraries
+library(tidyverse)
+library(here)
+library(survival)
+library(tidylog)
+
+# File path for data
+# TODO: Fill in your own file path here
+path_data <- file.path("")
+
+# Load raw/original patient data
+# TODO: Fill in your own dataset here
+df_raw <- read_csv(here(path_data, "df_raw.xlsx")) %>% janitor::clean_names()
+
+# Load weighting data for T stage and Gleason grade
+# This is only necessary if you do not have substage for clinical T stage (for example, you only have T2 but not T2a/T2b/T2c)
+# or if you do not have primary/secondary Gleason score (for example, you only have 7 but not 3+4/4+3)
+# TODO: Currently this loads these from the same folder that the project is in, but you can change the file path if necessary
+df_clint_weights <- readRDS(here("df_clint_weights.rds"))
+df_gleason_weights <- readRDS(here("df_gleason_weights.rds"))
+
+```
+
+# Setup Data
+
+```{r setupdata}
+
+# TODO: Any necessary re-naming or cleaning of variables here
+df_initial1 <-
+  df_raw %>%
+  # TODO: Rename as necessary - this is just an example
+  rename(
+    mets = metastasis,
+    dod = pcadeath
+  ) %>%
+  mutate(
+    # TODO: We are using time to mets/death in years - calculate if necessary
+    lastmetsdate = if_else(mets == 1, metsdate, lastfollowupdate),
+    ttmets = rpdate %--% lastmetsdate / dyears(),
+    lastdeaddate = if_else(dead == 1, deathdate, lastfollowupdate),
+    ttdod = rpdate %--% lastmetsdate / dyears()
+  )
+
+```
+
+# Calculate Predicted Probability of BCR from MSK Models
+
+If you do not have substage for clinical T stage and/or primary and secondary Gleason, there is code below which uses the weight data loaded above to calculated predicted probabilities. If you do have this information, you can take this code out.
+
+
+```{r mskpred1}
+
+# Save out knots for splines
+k <- c(0.2, 4.66, 7.12, 96.53)
+
+# Set up variables for calculating risk
+df_initial2 <-
+  df_initial1 %>%
+  mutate(
+    # Calculate spline terms for preoperative PSA
+    sp2psa = pmax(psa - k[1],0)^3 - pmax(psa - k[3],0)^3 * (k[4] - k[1])/(k[4] - k[3]) + pmax(psa - k[4],0)^3 * (k[3] - k[1])/(k[4] - k[3]),
+    sp3psa = pmax(psa - k[2],0)^3 - pmax(psa - k[3],0)^3 * (k[4] - k[2])/(k[4] - k[3]) + pmax(psa - k[4],0)^3 * (k[3] - k[2])/(k[4] - k[3]),
+    
+    # Set up variables for calculating risk from MSK nomogram
+    # Primary Gleason score > 3
+    bxgg1cat =
+      case_when(
+        # Gleason 6 = 0
+        bxggs == 6 ~ 0,
+        # Gleason score 7 - use weights if primary/second not available
+        bxggs == 7 ~ df_gleason_weights$weight_gg1, # ~28% Gleason 4+3
+        # Gleason 8 = 1
+        bxggs >= 8 ~ 1
+      ),
+    # TODO: If you do have primary/secondary available, you can simply use this code instead
+    # bxgg1cat =
+    #   case_when(
+    #     bxgg1 <= 3 ~ 0,
+    #     bxgg1 >= 4 ~ 1
+    #   ),
+
+    # Secondary Gleason score > 3
+    bxgg2cat =
+      case_when(
+        # Gleason 6 = 0
+        bxggs == 6 ~ 0,
+        # Gleason score 7 - use weights
+        bxggs == 7 ~ df_gleason_weights$weight_gg2, # ~72% Gleason 3+4
+        # Gleason 8 = 1
+        bxggs >= 8 ~ 1
+      ),
+    # TODO: If you do have primary/secondary available, you can simply use this code instead
+    # bxgg2cat =
+    #   case_when(
+    #     bxgg2 <= 3 ~ 0,
+    #     bxgg2 >= 4 ~ 1
+    #   ),
+    
+    # Dummy variable - clinical stage T2a
+    clinstage2a =
+      case_when(
+        # If T2 stage, use weights
+        tstage == "T2" ~ df_clint_weights$weight_ct2a, # ~51% cT2a
+        # Otherwise, 0
+        !is.na(tstage) ~ 0
+      ),
+    # TODO: If you do have clinical substage, you can use this code
+    # clinstage2a =
+    #   case_when(
+    #     tstage == "T2a" ~ 1,
+    #     !is.na(tstage) ~ 0
+    #   ),
+
+    # Dummy variable - clinical stage T2b
+    clinstage2b =
+      case_when(
+        # If T2 stage, use weights
+        tstage == "T2" ~ df_clint_weights$weight_ct2b, # ~34% cT2b
+        # Otherwise, 0
+        !is.na(tstage) ~ 0
+      ),
+    # TODO: If you do have clinical substage, you can use this code
+    # clinstage2b =
+    #   case_when(
+    #     tstage == "T2b" ~ 1,
+    #     !is.na(tstage) ~ 0
+    #   ),
+    
+    # Dummy variable - clinical stage T2c
+    clinstage2c =
+      case_when(
+        # If T2 stage, use weights
+        tstage == "T2" ~ df_clint_weights$weight_ct2c, # ~15% cT2c
+        # Otherwise, 0
+        !is.na(tstage) ~ 0
+      ),
+    # TODO: If you do have clinical substage, you can use this code
+    # clinstage2c =
+    #   case_when(
+    #     tstage == "T2c" ~ 1,
+    #     !is.na(tstage) ~ 0
+    #   ),
+    
+    # Dummy variable - clinical stage >= T3
+    clinstage3 =
+      case_when(
+        tstage %in% c("T3a", "T3b") ~ 1,
+        !is.na(tstage) ~ 0
+      ),
+    
+    # Create outcome variables for competing risks analysis
+    crr_mets_outcome =
+      case_when(
+        mets == 0 & dead == 0 & ttmets == ttdead ~ 0, # Censored if no mets at all
+        mets == 1 ~ 1, # Distant metastasis = event
+        mets == 0 & dead == 1 ~ 2 # Death before development of metastasis = competing event
+      ),
+    
+    crr_dod_outcome =
+      case_when(
+        dod == 0 & dead == 0 ~ 0, # Censored if not dead
+        dod == 1 & dead == 1 ~ 1, # Death from disease = event
+        dod == 0 & dead == 1 ~ 2, # Other cause death = competing event
+      )
+  )
+
+# Check variables
+df_initial2 %>% count(tstage, clinstage2a, clinstage2b, clinstage2c, clinstage3)
+df_initial2 %>% count(bxgg1cat, bxgg2cat, bxggs) # bxgg1, bxgg2 can be added to check here if available
+df_initial2 %>% count(crr_mets_outcome, mets, dead)
+df_initial2 %>% count(crr_dod_outcome, dod, dead)
+
+
+```
+
+```{r mskpred2}
+
+# Calculate baseline risk from MSKCC nomogram
+# Use preoperative model at 5 years
+df_initial3 <-
+  df_initial2 %>%
+  mutate(
+    preopbcr_xb =
+      6.15800897 + # intercept
+      -0.34852011 * psa + # psa
+      0.00251028 * sp2psa + # sp2psa
+      -0.00684538 * sp3psa + # sp3psa
+      -1.99233848 * bxgg1cat + # primary Gleason > 3
+      -0.87483682 * bxgg2cat + # secondary Gleason > 3
+      -0.47465258 * clinstage2a + # clinical stage T2a
+      -0.95565945 * clinstage2b + # clinical stage T2b
+      -0.74726801 * clinstage2c + # clinical stage T2c
+      -1.26864741 * clinstage3, # clinical stage T3,
+    # Scaling parameter for Weibull model
+    scaling1 = 1.12572374,
+    
+    # Calculate predicted probability at 5 years using scaling parameter
+    # This gives SURVIVAL probability
+    preopbcr_pr5 = (1 + (exp(-1 * preopbcr_xb) * 5) ^ (1 / scaling1)) ^ -1,
+    
+    # Convert to event probability
+    preopbcr_pr5 = 1 - preopbcr_pr5
+  )
+
+# Range of baseline risk values
+df_initial3 %>% select(starts_with("preopbcr")) %>% skimr::skim()
+
+# Check for duplicates
+df_initial3 %>% janitor::get_dupes(mrn)
+
+# Final dataset
+df_master <-
+  df_initial3%>%
+  # Create quartiles for risk and exclude those missing data
+  mutate(quartile = ntile(preopbcr_pr5, 4)) %>%
+  filter(!is.na(preopbcr_pr5))
+
+```
+
+# Save Data
+
+```{r save}
+
+# overview of master analytic dataset
+skimr::skim(df_master)
+
+#saving master analytic data set
+saveRDS(
+  object = df_master,
+  file = here(path_data, "df_master.rds")
+)
+
+```

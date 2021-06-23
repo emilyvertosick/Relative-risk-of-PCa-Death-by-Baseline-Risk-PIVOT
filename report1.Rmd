@@ -1,0 +1,255 @@
+---
+title: "Risk of Metastasis/Death by Baseline Risk"
+subtitle: "Report"
+date: "`r format(Sys.Date(), format='%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+  word_document:
+    reference_docx: "templates/doc_template.docx"
+---
+
+<!-- YAML options for both HTML and Word documents are given here. Delete the options for the format you will not be using.-->
+
+```{r setup, include=FALSE}
+# set chunk defaults, code chunks are NOT printed in output for report
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r import, include=FALSE}
+# load libraries
+library(tidyverse)
+library(here)
+library(gtsummary)
+
+# saving r version 
+r_version <- version %>% {paste0(.$major, ".", .$minor)}
+
+# Import analysis result objects here
+load(here("report_results.Rdata"))
+
+# Load weights to reference if necessary
+# TODO: If you have both clinical T substage and primary/secondary biopsy Gleason, you will not need this
+df_clint_weights <- readRDS(here("df_clint_weights.rds"))
+df_gleason_weights <- readRDS(here("df_gleason_weights.rds"))
+
+```
+
+```{r numbers, echo = FALSE}
+
+# How many with non-missing data?
+totalN <- nrow(df_master)
+
+```
+
+# Methods
+
+There are a total of `r totalN` patients who had data available to get a prediction from the MSK pre-operative BCR nomogram (not missing PSA, Gleason score and clinical stage).
+
+<!-- TODO: This next paragraph of the methods section would not be relevant if you have both primary/secondary biopsy Gleason grade and substage for clinical T stage -->
+
+In this cohort, there was no data on primary or secondary Gleason grade, or on clinical substage for those patients who were listed as clinical stage T2. However, the MSK pre-operative BCR nomogram requires these two pieces of information. Given that they were not available, we used the cohort of surgical patients on which the nomogram was created to calculate weights to use when generating predictions. For clinical stage, we kept all clinical stage T2 patients in the nomograms data, and calculated the proportion that were cT2a (`r round(df_clint_weights$weight_ct2a*100)`%), cT2b (`r round(df_clint_weights$weight_ct2b*100)`%) and cT2c (`r round(df_clint_weights$weight_ct2c*100)`%) and used these weights in place of 0/1 indicators for the clinical stage variables. The same method was used for Gleason 7 patients, using the proportion of Gleason 3+4 (`r round(df_gleason_weights$weight_gg2*100)`%) and Gleason 4+3 (`r round(df_gleason_weights$weight_gg1*100)`%) patients from the original nomograms dataset. The nomogram incorporates preoperative PSA, Gleason grade and cllnical stage.
+
+For this analysis, the risk of BCR within 5 years after surgery was calculated for each patient based on the MSK nomogram. Our goal was to compare the risk of distant prostate cancer metastasis or prostate cancer death between patients who underwent immediate RP and those who did not. This was assessed in two ways.
+
+First, patients were grouped into 4 groups based on the quartiles of the risk score for the MSKCC BCR nomogram. Within each quartile of the risk score, competing risk regression for the outcomes of distant metastasis and death from prostate cancer was used, with the competing risk being death from another cause. Subhazard ratios are presented for the comparison between those who underwent immediate RP vs those who did not (reference group) in each quartile. These subhazard ratios and their standard errors were entered into a meta-analysis to determine whether there was heterogeneity between the estimates, which would indicate that the effect of immediate vs delayed RP differed based on a patient's baseline risk.
+
+Second, we performed an interaction analysis using risk of BCR within 5 years as a continuous variable and assessing whether there was a significant interaction with treatment (delayed or immediate RP) for the outcomes of distant prostate cancer metastasis and prostate cancer death. Again, competing risks regression with the competing risk of death from another cause was used. To visualize any possible interaction, a time-to-event generalized additive model (GAM) was created to estimate the risk of distant prostate cancer metastasis or prostate cancer death within 15 years by baseline risk (risk of BCR within 5 years) in each of the two treatment groups separately. The GAM model used a cubic spline basis function to account for non-linearity. The difference in risk between groups was also calculated and plotted, with 95% confidence intervals generated using bootstrap resampling.
+
+All analyses were conducted using R `r r_version`.
+
+# Results
+
+Among the `r totalN` patients in this cohort, `r Nmets` patients were diagnosed with distant metastasis, with `r Nmetscensored` of these patients being censored, while the other `r Nmetsdead` had died (`r Nmetsdod` from prostate cancer). Median follow-up for survivors was `r style_sigfig(medianfu[2])` years (quartiles `r style_sigfig(medianfu[1])`, `r style_sigfig(medianfu[2])`).
+
+## Patient Characteristics: By Quartiles
+
+### Table 1
+
+Patient characteristics presented by quartiles of risk of BCR within 5 years after surgery, based on the MSKCC nomogram.
+
+```{r table2, warning = FALSE}
+
+gt_summary_quartiles
+
+```
+
+## Competing Risk Results
+
+We separated the cohort into four subsets based on the quartiles for the risk of BCR within 5 years. We performed a competing risk regression for the outcome of prostate cancer death within each subset and present the results below. To check whether the association between treatment group and death differs between quartiles, we created a competing risk regression model for the full cohort, including treatment group, risk, and the interaction between treatment group and risk.
+
+### Distant Metastasis
+
+p-value for the interaction between treatment group and baseline risk (continuous) for distant metastasis: `r style_pvalue(df_analysis_int$model_full_int_p[df_analysis_int$outcome == "mets"][[1]], prepend_p = TRUE)`
+
+p-value for heterogeneity of effect between quartiles for distant metastasis: `r style_pvalue(df_meta$meta_results[df_meta$outcome == "mets"][[1]] %>% pluck("pval.Q"), prepend_p = TRUE)`
+
+```{r figure2}
+
+meta::forest(
+  x = df_meta$meta_results[df_meta$outcome == "mets"][[1]],
+  text.fixed = "Fixed effects estimate",
+  text.random = "Random effects estimate",
+  studlab = TRUE,
+  comb.fixed = TRUE,
+  comb.random = TRUE,
+  leftcols = c("studlab"),
+  leftlabs = c("Quartile"),
+  col.fixed = "red",
+  col.random = "white",
+  rightcols = c("effect.ci", "w.fixed"),
+  rightlabs = c("SHR (95% CI)", "Weights"),
+  smlab = "Subhazard Ratio",
+  overall.hetstat = FALSE
+)
+
+```
+
+### Prostate Cancer Death
+
+p-value for the interaction between treatment group and baseline risk for prostate cancer death: `r style_pvalue(df_analysis_int$model_full_int_p[df_analysis_int$outcome == "dod"][[1]], prepend_p = TRUE)`
+
+p-value for heterogeneity of effect between quartiles for death from disease: `r style_pvalue(df_meta$meta_results[df_meta$outcome == "dod"][[1]] %>% pluck("pval.Q"), prepend_p = TRUE)`
+
+```{r figure3}
+
+meta::forest(
+  x = df_meta$meta_results[df_meta$outcome == "dod"][[1]],
+  text.fixed = "Fixed effects estimate",
+  text.random = "Random effects estimate",
+  studlab = TRUE,
+  comb.fixed = TRUE,
+  comb.random = TRUE,
+  leftcols = c("studlab"),
+  leftlabs = c("Quartile"),
+  col.fixed = "red",
+  col.random = "white",
+  rightcols = c("effect.ci", "w.fixed"),
+  rightlabs = c("SHR (95% CI)", "Weights"),
+  smlab = "Subhazard Ratio",
+  overall.hetstat = FALSE
+)
+
+```
+
+## Risk by Treatment Group
+
+Risk of distant metastasis or prostate cancer death within 15 years, by baseline risk of BCR within 5 years, for immediate RP (dashed line) and delayed RP (solid line) groups.
+
+### Distant Metastasis
+
+```{r mets1}
+
+df_gam_graph %>%
+  filter(outcome == "mets") %>%
+  pull(gg_cox_gam) %>%
+  pluck(1)
+
+```
+
+### Prostate Cancer Death
+
+```{r dod1}
+
+df_gam_graph %>%
+  filter(outcome == "dod") %>%
+  pull(gg_cox_gam) %>%
+  pluck(1)
+
+```
+
+## Difference in Risk by Treatment Group
+
+Difference in risk of distant metastasis or prostate cancer death between the immediate RP and delayed RP groups, with 95% confidence interval. Confidence interval estimated using bootstrap resampling.
+
+### Distant Metastasis
+
+```{r mets2}
+
+df_prdiff_plot %>%
+  filter(outcome == "mets") %>%
+  pull(gg_prdiff) %>%
+  pluck(1)
+
+```
+
+### Prostate Cancer Death
+
+```{r dod2}
+
+df_prdiff_plot %>%
+  filter(outcome == "dod") %>%
+  pull(gg_prdiff) %>%
+  pluck(1)
+
+```
+
+## Sensitivity Analysis Including Age
+
+As a sensitivity analysis, we investigated whether age had an effect on the results of our analysis, as the effects of treatment could be lessened if patients with worse disease were older. The median (quartiles) age in this cohort was `r inline_text(gt_summary_all, variable = "age")`.
+
+In this analysis, we have repeated the competing risks models including age as a covariate for each of the quartile-level models for distant metastasis and death from prostate cancer. Age was also added as a covariate to the competing risks models assessing possible interactions between baseline risk and risk of distant metastasis or prostate cancer death.
+
+```{r senstable1, warning = FALSE}
+
+gt_model_full_crr
+
+```
+
+<br>
+
+### Distant Metastasis
+
+p-value for the interaction between treatment group and baseline risk (continuous) for distant metastasis: `r style_pvalue(df_analysis_int$model_age_full_int_p[df_analysis_int$outcome == "mets"][[1]], prepend_p = TRUE)`
+
+p-value for heterogeneity of effect between quartiles for distant metastasis: `r style_pvalue(df_meta$meta_results_age[df_meta$outcome == "mets"][[1]] %>% pluck("pval.Q"), prepend_p = TRUE)`
+
+```{r sensfigure2}
+
+meta::forest(
+  x = df_meta$meta_results_age[df_meta$outcome == "mets"][[1]],
+  text.fixed = "Fixed effects estimate",
+  text.random = "Random effects estimate",
+  studlab = TRUE,
+  comb.fixed = TRUE,
+  comb.random = TRUE,
+  leftcols = c("studlab"),
+  leftlabs = c("Quartile"),
+  col.fixed = "red",
+  col.random = "white",
+  rightcols = c("effect.ci", "w.fixed"),
+  rightlabs = c("SHR (95% CI)", "Weights"),
+  smlab = "Subhazard Ratio",
+  overall.hetstat = FALSE
+)
+
+```
+
+### Prostate Cancer Death
+
+p-value for the interaction between treatment group and baseline risk for prostate cancer death: `r style_pvalue(df_analysis_int$model_age_full_int_p[df_analysis_int$outcome == "dod"][[1]], prepend_p = TRUE)`
+
+p-value for heterogeneity of effect between quartiles for death from disease: `r style_pvalue(df_meta$meta_results_age[df_meta$outcome == "dod"][[1]] %>% pluck("pval.Q"), prepend_p = TRUE)`
+
+```{r sensfigure3}
+
+meta::forest(
+  x = df_meta$meta_results_age[df_meta$outcome == "dod"][[1]],
+  text.fixed = "Fixed effects estimate",
+  text.random = "Random effects estimate",
+  studlab = TRUE,
+  comb.fixed = TRUE,
+  comb.random = TRUE,
+  leftcols = c("studlab"),
+  leftlabs = c("Quartile"),
+  col.fixed = "red",
+  col.random = "white",
+  rightcols = c("effect.ci", "w.fixed"),
+  rightlabs = c("SHR (95% CI)", "Weights"),
+  smlab = "Subhazard Ratio",
+  overall.hetstat = FALSE
+)
+
+```

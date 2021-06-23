@@ -1,0 +1,942 @@
+---
+title: "Risk of Metastasis/Death by Baseline Risk"
+subtitle: "Analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Analytic Data Import
+
+```{r import}
+# load libraries
+library(tidyverse)
+library(here)
+library(survival)
+library(gt)
+library(gtsummary)
+set.seed(86453768)
+
+# Data file path
+# TODO: Fill in your own file path here
+path_data <- file.path("O:\\Outcomes\\Andrew\\Analytic Projects\\1 Active\\Vickers Relative risk of PCa Death by Baseline Risk (SPCG4 Cohort)\\2020-06-01")
+
+# importing master analytic data set
+df_master <-
+  readRDS(
+    file = here(path_data, "df_master.rds")
+  )
+
+```
+
+# Set up Framework for Analysis
+
+```{r analysisetup}
+
+# Create a dataset with four different groupings - grouped by quartiles of predicted probability of BCR score
+df_analysis <-
+  df_master %>%
+  nest(df_model = -c(quartile)) %>%
+  arrange(quartile) %>%
+  filter(!is.na(quartile)) %>%
+  mutate(
+    # Save out ranges of predicted probability values for each
+    lower_pr = map_dbl(df_model, ~ min(..1$preopbcr_pr5, na.rm = TRUE)),
+    upper_pr = map_dbl(df_model, ~ max(..1$preopbcr_pr5, na.rm = TRUE))
+  )
+
+```
+
+# Summary Tables and Figures
+
+```{r table1}
+
+# Table 1 for all who aren't missing data
+gt_summary_all <-
+  df_master %>%
+  select(age, psa, bxggs, tstage, detectionmode, preopbcr_pr5, rp) %>%
+  tbl_summary(
+    digits = list("age" ~ 0), # "psa" ~ c(0, 1, 1)),
+    label = list("preopbcr_pr5" ~ "Risk of BCR at 5 Years",
+                 "rp" ~ "Immediate RP")
+  ) %>%
+  modify_footnote(everything() ~ NA)
+
+gt_summary_all
+
+# Table 1 by quartiles
+gt_summary_quartiles <-
+  df_master %>%
+  group_by(quartile) %>%
+  mutate(
+    quartilelabel =
+      case_when(
+        quartile == 1 ~ "First",
+        quartile == 2 ~ "Second",
+        quartile == 3 ~ "Third",
+        quartile == 4 ~ "Fourth"
+      ),
+    rangemin = min(preopbcr_pr5, na.rm = TRUE),
+    rangemax = max(preopbcr_pr5, na.rm = TRUE),
+    label = as.character(str_glue("{quartilelabel} Quartile:<br> Risk {style_percent(rangemin)}% - {style_percent(rangemax)}%")) %>% factor()
+  ) %>%
+  ungroup() %>%
+  select(age, psa, bxggs, tstage, detectionmode, preopbcr_pr5, rp, label) %>%
+  tbl_summary(
+    by = label,
+    digits = list("age" ~ 0), #, "psa" ~ c(0, 1, 1)),
+    label = list("preopbcr_pr5" ~ "Risk of BCR at 5 Years",
+                 "rp" ~ "Radical Prostatectomy")
+  ) %>%
+  modify_footnote(everything() ~ NA)
+
+gt_summary_quartiles
+
+# Histogram of risk
+gg_risk_histogram <-
+  ggplot(
+    df_master,
+    aes(x = preopbcr_pr5)
+  ) +
+  geom_histogram(bins = 35) +
+  labs(
+    y = "",
+    x = "Risk of BCR within 5 years"
+  )
+
+gg_risk_histogram
+
+# Save out counts
+
+# Number with metastasis
+Nmets <- nrow(df_master %>% filter(mets == 1))
+Nmetscensored <- nrow(df_master %>% filter(mets == 1 & dead == 0 & dod == 0))
+Nmetsdead <- nrow(df_master %>% filter(mets == 1 & dead == 1))
+Nmetsdod <- nrow(df_master %>% filter(mets == 1 & dead == 1 & dod == 1))
+
+# Save out median followup (with quartiles) for survivors
+medianfu <-
+  df_master %>%
+  filter(dead == 0) %>%
+  {quantile(.$ttdead, c(0.25, 0.5, 0.75))}
+
+```
+
+# Distant Metastasis or Prostate Cancer Death by Baseline Risk Group
+
+This analysis is performed for both outcomes (prostate cancer metastasis and prostate cancer death). A separate competing risks regression model is created in each quartile of patients with the covariate of interest being treatment group (immediate RP or delayed RP) so that the estimate in each group can be meta-analyzed later. As a sensitivity analysis, these analyses were repeating adjusting for age, as the version of the MSK BCR model used to calculate risk of BCR for this analysis did not include age as a covariate.
+
+## Create Competing Risk Models
+
+```{r crranalysis}
+
+# Create Cox model for each cohort separately (exclude NA)
+df_analysis_crr <-
+  # Save out rows for mets outcome and rows for DOD outcome
+  bind_rows(
+    df_analysis %>% mutate(outcome = "mets"),
+    df_analysis %>% mutate(outcome = "dod")
+  ) %>%
+  # Rename outcome variables to be the same in each dataset for consistency when creating models
+  mutate(
+    df_model =
+      map2(
+        df_model, outcome,
+        ~ ..1 %>%
+          rename(
+            ttout := as.character(str_glue("tt{..2}")),
+            out := as.character(str_glue("{..2}")),
+            crr_outcome := as.character(str_glue("crr_{..2}_outcome")))
+      ),
+    # Create competing risk model for each outcome
+    model_crr =
+      map2(
+        df_model, outcome,
+        ~ cmprsk::crr(
+          ftime = ..1[["ttout"]],
+          fstatus = ..1[["crr_outcome"]],
+          cov1 = ..1[c("rp")],
+          failcode = 1, # Event (mets or DOD)
+          cencode = 0 # Censored
+        )
+      ),
+    
+    # Sensitivity analysis adjusting for age
+    model_age_crr =
+      map2(
+        df_model, outcome,
+        ~ cmprsk::crr(
+          ftime = ..1[["ttout"]],
+          fstatus = ..1[["crr_outcome"]],
+          cov1 = ..1[c("rp", "age")],
+          failcode = 1, # Event (mets or DOD)
+          cencode = 0 # Censored
+        )
+      ),
+    
+    
+    # Pull out SHR, CI, p value
+    model_results =
+      pmap(
+        list(model_crr, lower_pr, upper_pr),
+        # First, get SHR and 95% CI
+        ~ summary(..1)$conf.int %>%
+          as_tibble() %>%
+          set_names(c("shr", "shr_rev", "shr_lb", "shr_ub")) %>%
+          # Add in coefficient, SE, p value
+          bind_cols(
+            summary(..1)$coef %>%
+              as_tibble() %>%
+              set_names(c("coef", "expcoef", "se_coef", "z", "p.value")) %>%
+              select(-expcoef, -z)
+          ) %>%
+          # Add labels
+          bind_cols(
+            tribble(
+              ~label,
+              str_glue("Risk {style_percent(..2)}% - {style_percent(..3)}%")
+            )
+          )
+      ),
+    # Pull out results for sensitivity analysis model adjusted for age
+    model_age_results =
+      pmap(
+        list(model_age_crr, lower_pr, upper_pr),
+        # First, get SHR and 95% CI
+        ~ summary(..1)$conf.int %>%
+          as_tibble(rownames = "var") %>%
+          set_names(c("var", "shr", "shr_rev", "shr_lb", "shr_ub")) %>%
+          # Add in coefficient, SE, p value
+          left_join(
+            summary(..1)$coef %>%
+              as_tibble(rownames = "var") %>%
+              set_names(c("var", "coef", "expcoef", "se_coef", "z", "p.value")) %>%
+              select(-expcoef, -z),
+            by = "var"
+          ) %>%
+          # Keep only RP
+          filter(var == "rp") %>%
+          # Add labels
+          bind_cols(
+            tribble(
+              ~label,
+              str_glue("Risk {style_percent(..2)}% - {style_percent(..3)}%")
+            )
+          )
+      )
+  )
+
+# Create table of CRR results
+gt_model_crr <-
+  df_analysis_crr %>%
+  select(outcome, model_results) %>%
+  unnest(model_results) %>%
+  gt() %>%
+  cols_move_to_start(columns = "label") %>%
+  cols_hide(columns = c("shr_rev", "coef", "se_coef", "p.value", "outcome")) %>%
+  fmt(columns = c("shr", "shr_lb", "shr_ub"), fns = style_ratio) %>%
+  cols_label(
+    label = "Risk Score",
+    shr = "SHR",
+    shr_lb = "95% CI",
+  ) %>%
+  tab_row_group(
+    label = "Prostate Cancer Death",
+    rows = outcome == "dod"
+  ) %>%
+  cols_merge(columns = c("shr_lb", "shr_ub"), pattern = "{1}, {2}") %>%
+  tab_row_group(
+    label = "Distant Metastasis",
+    rows = outcome == "mets"
+  )
+
+gt_model_crr
+
+# Create same table for sensitivity analysis with age
+gt_model_age_crr <- 
+  df_analysis_crr %>%
+  select(outcome, model_age_results) %>%
+  unnest(model_age_results) %>%
+  gt() %>%
+  cols_move_to_start(columns = "label") %>%
+  cols_hide(columns = c("var", "shr_rev", "coef", "se_coef", "p.value", "outcome")) %>%
+  fmt(columns = c("shr", "shr_lb", "shr_ub"), fns = style_ratio) %>%
+  cols_label(
+    label = "Risk Score",
+    shr = "SHR",
+    shr_lb = "95% CI",
+  ) %>%
+  tab_row_group(
+    label = "Prostate Cancer Death",
+    rows = outcome == "dod"
+  ) %>%
+  cols_merge(columns = c("shr_lb", "shr_ub"), pattern = "{1}, {2}") %>%
+  tab_row_group(
+    label = "Distant Metastasis",
+    rows = outcome == "mets"
+  )
+
+gt_model_age_crr
+
+# Create table with both
+gt_model_full_crr <-
+  df_analysis_crr %>%
+  select(outcome, model_results, model_age_results) %>%
+  mutate(model_age_results = map(model_age_results, ~ .x %>% rename_with(~str_glue("{.}_age")))) %>%
+  unnest(model_results) %>%
+  unnest(model_age_results) %>%
+  gt() %>%
+  cols_move_to_start(columns = "label") %>%
+  cols_hide(columns = c("shr_rev", "coef", "se_coef", "p.value", "outcome", "label_age",
+                        "var_age", "shr_rev_age", "coef_age", "se_coef_age", "p.value_age")) %>%
+  fmt(columns = c("shr", "shr_lb", "shr_ub", "shr_age", "shr_lb_age", "shr_ub_age"), fns = style_ratio) %>%
+  cols_label(
+    label = "Risk Score",
+    shr = "SHR",
+    shr_lb = "95% CI",
+    shr_age = "SHR",
+    shr_lb_age = "95% CI"
+  ) %>%
+  cols_merge(columns = c("shr_lb", "shr_ub"), pattern = "{1}, {2}") %>%
+  cols_merge(columns = c("shr_lb_age", "shr_ub_age"), pattern = "{1}, {2}") %>%
+  tab_row_group(
+    label = "Prostate Cancer Death",
+    rows = outcome == "dod"
+  ) %>%
+  tab_row_group(
+    label = "Distant Metastasis",
+    rows = outcome == "mets"
+  ) %>%
+  tab_spanner(label = "Univariate", columns = c("shr", "shr_lb", "shr_ub")) %>%
+  tab_spanner(label = "+ Age", columns = c("shr_age", "shr_lb_age", "shr_ub_age"))
+
+gt_model_full_crr
+
+```
+
+## Heterogeneity Analysis
+
+Here, we enter the estimate and standard error from each model (one for each quartile) into a meta-analysis to determine whether there is heterogeneity between the estimates. Significant heterogeneity between quartiles would indicate that the effect of RP on prostate cancer metastasis/death differs based on a patient's baseline risk.
+
+```{r het}
+
+# Collapse data for meta-analysis
+df_meta <-
+  left_join(
+    df_analysis_crr %>%
+      select(outcome, model_results) %>%
+      unnest(model_results) %>%
+      nest(df_shr = -c(outcome)),
+    df_analysis_crr %>%
+      select(outcome, model_age_results) %>%
+      unnest(model_age_results) %>%
+      rename_all(~ paste0(., "_age")) %>%
+      rename(outcome = outcome_age) %>%
+      nest(df_shr_age = -c(outcome)),
+    by = "outcome"
+  ) %>%
+  mutate(
+    # Using the "meta" package, meta-analysis the estimates (subhazard ratios) across quartile groups
+    meta_results =
+      map(
+        df_shr,
+        ~ meta::metagen(
+          data = ..1,
+          TE = coef,
+          seTE = se_coef,
+          studlab = label,
+          sm = "HR",
+          comb.fixed = TRUE,
+          comb.random = TRUE
+        )
+      ),
+    # Repeat meta-analysis for sensitivity analysis including age
+    meta_results_age =
+      map(
+        df_shr_age,
+        ~ meta::metagen(
+          data = ..1,
+          TE = coef_age,
+          seTE = se_coef_age,
+          studlab = label_age,
+          sm = "HR",
+          comb.fixed = TRUE,
+          comb.random = TRUE
+        )
+      )
+  )
+
+# Save out information to print in tables
+
+# Distant metastasis outcome
+df_meta_results_mets <-
+  df_meta$meta_results[df_meta$outcome == "mets"][[1]]
+
+df_meta_results_mets <-
+  as_tibble(df_meta_results_mets) %>%
+  select(studlab, TE, lower, upper) %>%
+  bind_rows(
+    tribble(
+      ~studlab, ~TE, ~lower, ~upper,
+      "Fixed Effects", df_meta_results_mets$TE.fixed,
+      df_meta_results_mets$lower.fixed, df_meta_results_mets$upper.fixed,
+      "Random Effects", df_meta_results_mets$TE.random,
+      df_meta_results_mets$lower.random, df_meta_results_mets$upper.random
+    )
+  ) %>%
+  mutate_at(vars(TE, lower, upper), ~exp(.))
+
+# Prostate cancer death outcome
+df_meta_results_dod <-
+  df_meta$meta_results[df_meta$outcome == "dod"][[1]]
+
+df_meta_results_dod <-
+  as_tibble(df_meta_results_dod) %>%
+  select(studlab, TE, lower, upper) %>%
+  bind_rows(
+    tribble(
+      ~studlab, ~TE, ~lower, ~upper,
+      "Fixed Effects", df_meta_results_dod$TE.fixed,
+      df_meta_results_dod$lower.fixed, df_meta_results_dod$upper.fixed,
+      "Random Effects", df_meta_results_dod$TE.random,
+      df_meta_results_dod$lower.random, df_meta_results_dod$upper.random
+    )
+  ) %>%
+  mutate_at(vars(TE, lower, upper), ~exp(.))
+
+# Create table with both metastasis and prostate cancer death results
+gt_meta_results <-
+  left_join(
+    df_meta_results_mets %>%
+      mutate_at(
+        vars(-studlab),
+        list("mets" = ~ style_ratio(.))
+      ) %>%
+      select(studlab, ends_with("_mets")),
+    df_meta_results_dod %>%
+      mutate_at(
+        vars(-studlab),
+        list("dod" = ~ style_ratio(.))
+      ) %>%
+      select(studlab, ends_with("_dod")),
+    by = "studlab"
+  ) %>%
+  mutate(
+    ci_mets = str_glue("{lower_mets}, {upper_mets}"),
+    ci_dod = str_glue("{lower_dod}, {upper_dod}")
+  ) %>%
+  filter(!str_detect(studlab, "Effects")) %>%
+  flextable::flextable(
+    col_keys = c("studlab", "TE_mets", "ci_mets", "TE_dod", "ci_dod")
+  ) %>%
+  flextable::autofit() %>%
+  flextable::set_header_labels(
+    studlab = "Quartile",
+    TE_mets = "sHR",
+    ci_mets = "95% CI",
+    TE_dod = "sHR",
+    ci_dod = "95% CI"
+  ) %>%
+  flextable::add_header(
+    TE_mets = "Distant Metastasis",
+    ci_mets = "Distant Metastasis",
+    TE_dod = "Prostate Cancer Death",
+    ci_dod = "Prostate Cancer Death",
+    top = TRUE
+  ) %>%
+  flextable::merge_h(part = "header") %>%
+  flextable::padding(part = "header", padding.bottom = 5) %>%
+  flextable::align(part = "all", align = "center") %>%
+  flextable::align(j = "studlab", align = "left")
+
+gt_meta_results
+
+```
+
+# Interaction Analysis
+
+The previous analyses up until this point used baseline risk of BCR as a categorical variable - four groups based on the quartiles of risk distribution in this population. The next analysis tests a similar hypothesis using baseline risk of BCR as a continuous variable, with an interaction term between baseline risk and treatment group (immediate or delayed RP). Again, competing risk regression is used.
+
+```{r interaction}
+
+# Create a dataset which has an interaction between treatment group (rp) and risk of BCR (continuous variable)
+df_master_int <-
+  df_master %>%
+  mutate(int_rp_risk = rp * preopbcr_xb)
+
+# Create for both mets and prostate cancer death
+df_analysis_int <-
+  tibble(outcome = c("mets", "dod")) %>%
+  mutate(
+    # Primary analysis
+    model_crr_full =
+      map(
+        outcome,
+        ~ cmprsk::crr(
+          ftime = df_master_int[[as.character(str_glue("tt{..1}"))]],
+          fstatus = df_master_int[[as.character(str_glue("crr_{..1}_outcome"))]],
+          cov1 = df_master_int[c("rp", "preopbcr_xb", "int_rp_risk")],
+          failcode = 1,
+          cencode = 0
+        )
+      ),
+    # Pull out interaction p value
+    model_full_int_p =
+      map_dbl(
+        model_crr_full,
+        ~ summary(..1)$coef %>%
+          as_tibble(rownames = "var") %>%
+          janitor::clean_names() %>%
+          filter(var == "int_rp_risk") %>%
+          pull(p_value)
+      ),
+    # Sensitivity analysis including age as a covariate
+    model_age_crr_full =
+      map(
+        outcome,
+        ~ cmprsk::crr(
+          ftime = df_master_int[[as.character(str_glue("tt{..1}"))]],
+          fstatus = df_master_int[[as.character(str_glue("crr_{..1}_outcome"))]],
+          cov1 = df_master_int[c("age", "rp", "preopbcr_xb", "int_rp_risk")],
+          failcode = 1,
+          cencode = 0
+        )
+      ),
+    # Pull out interaction p value
+    model_age_full_int_p =
+      map_dbl(
+        model_age_crr_full,
+        ~ summary(..1)$coef %>%
+          as_tibble(rownames = "var") %>%
+          janitor::clean_names() %>%
+          filter(var == "int_rp_risk") %>%
+          pull(p_value)
+      )
+  )
+
+```
+
+# Visualize Interaction
+
+We will then visualize the interaction (if any) using a generalized additive model (GAM). While previously we have been using competing risks regression for all analyses, here the generalized additive model will be based on a Cox model for simplicity. A separate model is created within each treatment group (immediate RP vs delayed RP) and for each outcome (prostate cancer metastasis and death).
+
+As a check on these results, we also created a generalized additive model using logistic regression for the outcome of prostate cancer metastasis or prostate cancer death within 15 years. Patients who did not have metastasis or death within 15 years and did not have at least 15 years of followup were excluded.
+
+```{r visinteraction}
+
+# Need separate model for each outcome and each group
+df_analysis_gam <-
+  list(
+    outcome = c("mets", "dod"),
+    rp = c(0, 1)
+  ) %>%
+  cross_df() %>%
+  mutate(
+    
+    # Save out dataset
+    df_model =
+      map2(
+        rp, outcome,
+        ~ df_master %>%
+          filter(rp == ..1) %>%
+          select(mrn, ends_with("preopbcr_xb"),
+                 contains(as.character(str_glue("{..2}"))), -contains("outcome")) %>%
+          rename(out := as.character(str_glue("{..2}")),
+                 ttout := as.character(str_glue("tt{..2}"))) %>%
+          mutate(
+            out15 =
+              case_when(
+                out == 1 & ttout <= 15 ~ 1,
+                out == 1 & ttout > 15 ~ 0,
+                out == 0 & ttout >= 15 ~ 0
+              )
+          )
+      ),
+    
+    # Create GAM model using Cox regression
+    # For Cox GAM models, the outcome needs to be the "time to event" and the actual event indicator goes into the "weights" option
+    cox_gam_model =
+      map(
+        df_model,
+        ~ mgcv::gam(
+          ttout ~ s(preopbcr_xb, bs = "cs"),
+          family = mgcv::cox.ph(),
+          data = ..1,
+          weights = out,
+          method = "REML"
+        )
+      ),
+    
+    # Create logistic GAM model for outcome within 15 years
+    logistic_gam_model =
+      map(
+        df_model,
+        ~ mgcv::gam(
+          out15 ~ s(preopbcr_xb, bs = "cs"),
+          family = "binomial",
+          data = ..1,
+          method = "REML"
+        )
+      ),
+    
+    # Get predictions from Cox GAM model
+    cox_gam_pred =
+      map2(
+        cox_gam_model, df_model,
+        ~ predict(
+          ..1,
+          newdata = ..2 %>% mutate(out = 0, ttout = 15),
+          se.fit = TRUE,
+          type = "response"
+        ) %>% as_tibble(.name_repair = "unique") %>%
+          set_names(c(".fitted_coxgam", ".se.fit_coxgam")) %>%
+          mutate(.fittedpr_coxgam = 1 - .fitted_coxgam)
+      ),
+    
+    # Get predictions from logistic GAM model
+    logistic_gam_pred =
+      map2(
+        logistic_gam_model, df_model,
+        ~ predict(
+          ..1,
+          newdata = ..2,
+          se.fit = TRUE,
+          type = "response"
+        ) %>% as_tibble(.name_repair = "unique") %>%
+          set_names(c(".fitted_loggam", ".se.fit_loggam"))
+      ),
+    
+    # Merge predictions from Cox GAM and logistic GAM models
+    df_gam_pred =
+      pmap(
+        list(df_model, cox_gam_pred, logistic_gam_pred),
+        ~ ..1 %>%
+          select(preopbcr_xb) %>%
+          bind_cols(..2, ..3)
+      )
+  )
+
+# Save out data for graph
+df_gam_final <-
+  df_analysis_gam %>%
+  select(outcome, rp, df_gam_pred) %>%
+  unnest(df_gam_pred) %>%
+  select(outcome, rp, contains("preopbcr"), contains("out"),
+         .fittedpr_coxgam, .fittedpr_loggam = .fitted_loggam) %>%
+  # merge in probabilities that correspond to linear predictors
+  # linear predictor used as a covariate in the model but we would like to graph by the actual predicted probability
+  left_join(df_master %>% select(preopbcr_xb, preopbcr_pr5), by = c("preopbcr_xb")) %>%
+  # Nest separately by outcome
+  nest(df_gam_pred = -c(outcome)) %>%
+  mutate(
+    label =
+      case_when(
+        outcome == "mets" ~ "Distant Metastasis",
+        outcome == "dod" ~ "Prostate Cancer Death"
+      )
+  )
+
+# Create graph for each outcome
+df_gam_graph <-
+  df_gam_final %>%
+  mutate(
+    
+    # Cox GAM model
+    gg_cox_gam =
+      map2(
+        df_gam_pred, label,
+        ~ ggplot() +
+          geom_density(data = ..1, aes(x = preopbcr_pr5, y = ..scaled..*0.8),
+                       col = "gray", fill = "gray", show.legend = FALSE) +
+          geom_line(data = ..1 %>% filter(rp == 0), aes(x = preopbcr_pr5, y = .fittedpr_coxgam)) +
+          geom_line(data = ..1 %>% filter(rp == 1), aes(x = preopbcr_pr5, y = .fittedpr_coxgam), linetype = "dashed") +
+          labs(
+            x = "Risk of BCR within 5 Years",
+            y = as.character(str_glue("Risk of {..2} within 15 Years"))
+          ) +
+          scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+          scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1))
+      ),
+    
+    # Logistic model
+    gg_logistic_gam =
+      map2(
+        df_gam_pred, label,
+        ~ ggplot() +
+          geom_density(data = ..1, aes(x = preopbcr_pr5, y = ..scaled..*0.8),
+                       col = "gray", fill = "gray", show.legend = FALSE) +
+          geom_line(data = ..1 %>% filter(rp == 0), aes(x = preopbcr_pr5, y = .fittedpr_loggam)) +
+          geom_line(data = ..1 %>% filter(rp == 1), aes(x = preopbcr_pr5, y = .fittedpr_loggam), linetype = "dashed") +
+          labs(
+            x = "Risk of BCR within 5 Years",
+            y = as.character(str_glue("Risk of {..2} within 15 Years"))
+          ) +
+          scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+          scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1))
+      )
+  )
+
+# TODO: This data file will be included in the results file to be sent to be - this should not contain any PHI unless there were any changes made to the code above, so these are just results. I will use this data to graph the results from your cohort along with the results from the other cohorts.
+
+# Save out results from graphs
+# TODO: This data will also be saved in the results file to be sent to me - since the graph was created using the df_gam_final data which has no PHI, this will not have PHI either, and will aid me to combining all the graphs for this analysis.
+df_gam_graphdata <-
+  df_gam_graph %>%
+  mutate(
+    df_cox_gam =
+      map(
+        gg_cox_gam,
+        ~ ggplot_build(..1)
+      ),
+    df_logistic_gam =
+      map(
+        gg_logistic_gam,
+        ~ ggplot_build(..1)
+      )
+  ) %>%
+  select(outcome, df_cox_gam, df_logistic_gam)
+
+```
+
+# Bootstrap CI for Difference in Risk
+
+Emily and Andrew discussed creating a figure for the difference in risk between RP and WW groups. To get a confidence interval, we need to bootstrap.
+
+```{r bootstrap}
+
+# Number of bootstrap reps
+bootstrapn <- 200
+
+# Create list of bootstrap indicators
+# This will be used to determine 
+df_bs_map <-
+  list(
+    boot = c(1:bootstrapn),
+    rp = c(0, 1)
+  ) %>%
+  cross_df() %>%
+  mutate(
+    bootassign = map(rp, ~ sample.int(nrow(df_master %>% filter(rp == ..1)), replace = TRUE))
+  ) %>%
+  # Create boot 0 for full cohort - this will give true central estimate
+  bind_rows(
+    tibble(boot = 0, rp = c(0, 1)) %>%
+      mutate(bootassign = map(rp, ~ seq(1, nrow(df_master %>% filter(rp == ..1)), 1)))
+  )
+
+# Create list of bootstraps x outcome
+df_bs_analysis <-
+  # Create a dataset with a separate row for every treatment group/outcome/bootstrap number combination
+  list(
+    boot = c(0:bootstrapn),
+    rp = c(0, 1),
+    outcome = c("mets", "dod")
+  ) %>%
+  cross_df() %>%
+  left_join(
+    df_bs_map,
+    by = c("boot", "rp")
+  ) %>%
+  # Create Cox GAM model for each group
+  mutate(
+    cox_gam =
+      pmap(
+        # Pass treatment assignment, list of observations to include in bootstrapped dataset, and outcome (mets or dod)
+        list(rp, bootassign, outcome),
+        ~ mgcv::gam(
+          # Outcome is time to event, predictor is baseline risk
+          ttout ~ s(preopbcr_pr5, bs = "cs"),
+          family = mgcv::cox.ph(),
+          data =
+            df_master %>%
+            # Keep only treatment group of interest
+            filter(rp == ..1) %>%
+            # This function keeps those rows which match to the bootstrap assignments
+            # This is how we end up with a resampled with replacement dataset
+            slice(..2) %>%
+            # Rename variables for consistency
+            rename(
+              out := as.character(str_glue("{..3}")),
+              ttout := as.character(str_glue("tt{..3}"))
+            ),
+          # Cox GAM model syntax puts the outcome variable in the "weights" field
+          weights = out,
+          method = "REML"
+        )
+      ),
+    
+    # Create GAM prediction for 0%-100%
+    # This first gives just a prediction ("fit") and standard error ("se.fit")
+    cox_pred =
+      map(
+        cox_gam,
+        # Cox GAM - to get predicted probabilities, give time to outcome, set outcome/event indicator to 0
+        # This gives a prediction for every baseline risk from 0% to 100%
+        ~ predict(
+          ..1,
+          newdata = tibble(preopbcr_pr5 = seq(0, 1, length.out = 100), out = 0, ttout = 15),
+          se.fit = TRUE,
+          type = "response"
+        ) %>% as_tibble()
+      ),
+    # Merge that prediction and standard error with the actual baseline risk values for graphing
+    cox_pred =
+      map(
+        cox_pred,
+        # Bind column of predicted probabilities to
+        ~ bind_cols(
+          ..1,
+          tibble(preopbcr_pr5 = seq(0, 1, length.out = 100), out = 0, ttout = 15)
+        ) %>%
+          # Convert "fit" variable to event probability
+          mutate(event_pr = 1 - fit)
+      )
+  )
+
+# Save out all predictions and calculate difference
+df_bs_pred <-
+  df_bs_analysis %>%
+  select(boot, rp, outcome, cox_pred) %>%
+  unnest(cox_pred) %>%
+  # Reshape to wide to calculate difference between immediate RP and delayed RP
+  select(boot, rp, outcome, preopbcr_pr5, ttout, event_pr) %>%
+  pivot_wider(
+    names_from = "rp",
+    names_prefix = "event_pr",
+    values_from = "event_pr"
+  ) %>%
+  mutate(event_pr_diff = event_pr0 - event_pr1)
+
+# Central estimate is boot = 0, so save this out separately
+df_centralest <-
+  df_bs_pred %>%
+  filter(boot == 0) %>%
+  select(-boot)
+
+# To get SE, keep all other bootstrap resamples (except true dataset boot = 0)
+df_bs_final <-
+  df_bs_pred %>%
+  filter(boot != 0) %>%
+  # Group by value of preopbcr_pr5
+  nest(df_pred = -c(outcome, preopbcr_pr5)) %>%
+  # Standard error for bootstrap = standard deviation of difference between groups
+  mutate(
+    se = map_dbl(df_pred, ~ sd(..1[["event_pr_diff"]], na.rm = TRUE))
+  ) %>%
+  # Keep 95% CI and merge back in with central estimate
+  select(-df_pred) %>%
+  left_join(
+    df_centralest,
+    by = c("outcome", "preopbcr_pr5")
+  ) %>%
+  mutate(
+    lb = event_pr_diff - 1.96*se,
+    lb = if_else(lb < 0, 0, lb),
+    ub = event_pr_diff + 1.96*se,
+    ub = if_else(ub > 1, 1, ub)
+  ) %>%
+  select(outcome, preopbcr_pr5, event_pr_diff, lb, ub) %>%
+  nest(df_plot = -c(outcome))
+
+# Graph difference between groups with 95% CI                                                                    
+df_prdiff_plot <-
+  df_bs_final %>%
+  # Create label for graph
+  mutate(
+    label = 
+      case_when(
+        outcome == "mets" ~ "Distant Metastasis",
+        outcome == "dod" ~ "Prostate Cancer Death"
+      )
+  ) %>%
+  # Create graph
+  mutate(
+    gg_prdiff =
+      map2(
+        df_plot, label,
+        ~ ggplot(..1) +
+          geom_line(aes(x = preopbcr_pr5, y = event_pr_diff)) +
+          geom_line(aes(x = preopbcr_pr5, y = lb), col = "gray") +
+          geom_line(aes(x = preopbcr_pr5, y = ub), col = "gray") +
+          labs(
+            x = "Risk of BCR within 5 Years",
+            y = as.character(str_glue("Risk of {..2} within 15 Years"))
+          ) +
+          scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+          scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1))
+      )
+  )
+
+# TODO: Since this data has no PHI, this will also be included in results sent to me for combining graphs
+
+```
+
+# Discrimination
+
+To calculate discrimination, we will use a Cox model.
+
+```{r discrimination}
+
+# Calculate the c-index for Cox models
+df_analysis_disc <-
+  tibble(outcome = c("mets", "dod")) %>%
+  mutate(
+    
+    # Data for cox model
+    df_model =
+      map(
+        outcome,
+        ~ df_master %>%
+          rename(
+            out := as.character(str_glue("{..1}")),
+            ttout := as.character(str_glue("tt{..1}"))
+          )
+      ),
+    
+    # Create cox model
+    cox_model =
+      map(
+        df_model,
+        ~ coxph(
+          Surv(ttout, out) ~ preopbcr_xb,
+          data = ..1
+        )
+      ),
+    
+    # Pull out c-index
+    cindex =
+      map_dbl(
+        cox_model,
+        ~ ..1$concordance[["concordance"]]
+      )
+  )
+
+```
+
+# Save Results
+
+```{r save}
+
+# These results are saved for your use when running the report file
+save(
+  df_master, gt_summary_all, gt_summary_quartiles, Nmets, Nmetscensored, Nmetsdead, Nmetsdod, medianfu,
+  gt_model_full_crr, gt_meta_results, df_meta, df_analysis_int, df_gam_graph, df_prdiff_plot, df_analysis_disc,
+  file = here("report_results.Rdata")
+)
+
+
+# This is the results file that should be sent to MSK and only contains data points from graphs
+save(
+  df_gam_final, df_gam_graphdata, df_prdiff_plot,
+  file = here("msk_results_to_send.Rdata")
+)
+
+```
+
