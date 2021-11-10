@@ -539,8 +539,8 @@ df_analysis_gam <-
     outcome_time = c(10, 12, 15)
   ) %>%
   cross_df() %>%
-  # TODO: If you don't have 15 years for DOD you can filter it out here
-  filter(!(outcome == "dod" & outcome_time == 15)) %>%
+  # TODO: If you don't have 15 years for mets you can filter it out here
+  filter(!(outcome == "mets" & outcome_time == 15)) %>%
   mutate(
     # Save out dataset
     df_model =
@@ -742,8 +742,8 @@ df_bs_analysis <-
     outcome_time = c(10, 12, 15)
   ) %>%
   cross_df() %>%
-  # TODO: Again, dropping 15 year DOD here if not enough follow-up
-  filter(!(outcome == "dod" & outcome_time == 15)) %>%
+  # TODO: Again, dropping 15 year mets here if not enough follow-up
+  filter(!(outcome == "mets" & outcome_time == 15)) %>%
   left_join(
     df_bs_map,
     by = c("boot", "rp")
