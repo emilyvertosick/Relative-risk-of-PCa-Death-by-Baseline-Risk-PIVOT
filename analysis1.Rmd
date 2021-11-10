@@ -535,15 +535,17 @@ As a check on these results, we also created a generalized additive model using 
 df_analysis_gam <-
   list(
     outcome = c("mets", "dod"),
-    rp = c(0, 1)
+    rp = c(0, 1),
+    outcome_time = c(10, 12, 15)
   ) %>%
   cross_df() %>%
+  # TODO: If you don't have 15 years for DOD you can filter it out here
+  filter(!(outcome == "dod" & outcome_time == 15)) %>%
   mutate(
-    
     # Save out dataset
     df_model =
-      map2(
-        rp, outcome,
+      pmap(
+        list(rp, outcome, outcome_time),
         ~ df_master %>%
           filter(rp == ..1) %>%
           select(mrn, ends_with("preopbcr_xb"),
@@ -551,11 +553,11 @@ df_analysis_gam <-
           rename(out := as.character(str_glue("{..2}")),
                  ttout := as.character(str_glue("tt{..2}"))) %>%
           mutate(
-            out15 =
+            out_timepoint_est =
               case_when(
-                out == 1 & ttout <= 15 ~ 1,
-                out == 1 & ttout > 15 ~ 0,
-                out == 0 & ttout >= 15 ~ 0
+                out == 1 & ttout <= ..3 ~ 1,
+                out == 1 & ttout > ..3 ~ 0,
+                out == 0 & ttout >= ..3 ~ 0
               )
           )
       ),
@@ -574,12 +576,12 @@ df_analysis_gam <-
         )
       ),
     
-    # Create logistic GAM model for outcome within 15 years
+    # Create logistic GAM model for outcome within 10/12/15 years
     logistic_gam_model =
       map(
         df_model,
         ~ mgcv::gam(
-          out15 ~ s(preopbcr_xb, bs = "cs"),
+          out_timepoint_est ~ s(preopbcr_xb, bs = "cs"),
           family = "binomial",
           data = ..1,
           method = "REML"
@@ -588,11 +590,11 @@ df_analysis_gam <-
     
     # Get predictions from Cox GAM model
     cox_gam_pred =
-      map2(
-        cox_gam_model, df_model,
+      pmap(
+        list(cox_gam_model, df_model, outcome_time),
         ~ predict(
           ..1,
-          newdata = ..2 %>% mutate(out = 0, ttout = 15),
+          newdata = ..2 %>% mutate(out = 0, ttout = ..3),
           se.fit = TRUE,
           type = "response"
         ) %>% as_tibble(.name_repair = "unique") %>%
@@ -626,15 +628,15 @@ df_analysis_gam <-
 # Save out data for graph
 df_gam_final <-
   df_analysis_gam %>%
-  select(outcome, rp, df_gam_pred) %>%
+  select(outcome, rp, outcome_time, df_gam_pred) %>%
   unnest(df_gam_pred) %>%
   select(outcome, rp, contains("preopbcr"), contains("out"),
          .fittedpr_coxgam, .fittedpr_loggam = .fitted_loggam) %>%
   # merge in probabilities that correspond to linear predictors
   # linear predictor used as a covariate in the model but we would like to graph by the actual predicted probability
   left_join(df_master %>% select(preopbcr_xb, preopbcr_pr5), by = c("preopbcr_xb")) %>%
-  # Nest separately by outcome
-  nest(df_gam_pred = -c(outcome)) %>%
+  # Nest separately by outcome and outcome_time
+  nest(df_gam_pred = -c(outcome, outcome_time)) %>%
   mutate(
     label =
       case_when(
@@ -647,11 +649,10 @@ df_gam_final <-
 df_gam_graph <-
   df_gam_final %>%
   mutate(
-    
     # Cox GAM model
     gg_cox_gam =
-      map2(
-        df_gam_pred, label,
+      pmap(
+        list(df_gam_pred, label, outcome_time),
         ~ ggplot() +
           geom_density(data = ..1, aes(x = preopbcr_pr5, y = ..scaled..*0.8),
                        col = "gray", fill = "gray", show.legend = FALSE) +
@@ -659,7 +660,7 @@ df_gam_graph <-
           geom_line(data = ..1 %>% filter(rp == 1), aes(x = preopbcr_pr5, y = .fittedpr_coxgam), linetype = "dashed") +
           labs(
             x = "Risk of BCR within 5 Years",
-            y = as.character(str_glue("Risk of {..2} within 15 Years"))
+            y = as.character(str_glue("Risk of {..2} within {..3} Years"))
           ) +
           scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
           scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1))
@@ -667,8 +668,8 @@ df_gam_graph <-
     
     # Logistic model
     gg_logistic_gam =
-      map2(
-        df_gam_pred, label,
+      pmap(
+        list(df_gam_pred, label, outcome_time),
         ~ ggplot() +
           geom_density(data = ..1, aes(x = preopbcr_pr5, y = ..scaled..*0.8),
                        col = "gray", fill = "gray", show.legend = FALSE) +
@@ -676,7 +677,7 @@ df_gam_graph <-
           geom_line(data = ..1 %>% filter(rp == 1), aes(x = preopbcr_pr5, y = .fittedpr_loggam), linetype = "dashed") +
           labs(
             x = "Risk of BCR within 5 Years",
-            y = as.character(str_glue("Risk of {..2} within 15 Years"))
+            y = as.character(str_glue("Risk of {..2} within {..3} Years"))
           ) +
           scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
           scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1))
@@ -701,7 +702,7 @@ df_gam_graphdata <-
         ~ ggplot_build(..1)
       )
   ) %>%
-  select(outcome, df_cox_gam, df_logistic_gam)
+  select(outcome, outcome_time, df_cox_gam, df_logistic_gam)
 
 ```
 
@@ -712,7 +713,7 @@ Emily and Andrew discussed creating a figure for the difference in risk between 
 ```{r bootstrap}
 
 # Number of bootstrap reps
-bootstrapn <- 200
+bootstrapn <- 10
 
 # Create list of bootstrap indicators
 # This will be used to determine 
@@ -737,9 +738,12 @@ df_bs_analysis <-
   list(
     boot = c(0:bootstrapn),
     rp = c(0, 1),
-    outcome = c("mets", "dod")
+    outcome = c("mets", "dod"),
+    outcome_time = c(10, 12, 15)
   ) %>%
   cross_df() %>%
+  # TODO: Again, dropping 15 year DOD here if not enough follow-up
+  filter(!(outcome == "dod" & outcome_time == 15)) %>%
   left_join(
     df_bs_map,
     by = c("boot", "rp")
@@ -775,25 +779,25 @@ df_bs_analysis <-
     # Create GAM prediction for 0%-100%
     # This first gives just a prediction ("fit") and standard error ("se.fit")
     cox_pred =
-      map(
-        cox_gam,
+      pmap(
+        list(cox_gam, outcome_time),
         # Cox GAM - to get predicted probabilities, give time to outcome, set outcome/event indicator to 0
         # This gives a prediction for every baseline risk from 0% to 100%
         ~ predict(
           ..1,
-          newdata = tibble(preopbcr_pr5 = seq(0, 1, length.out = 100), out = 0, ttout = 15),
+          newdata = tibble(preopbcr_pr5 = seq(0, 1, length.out = 100), out = 0, ttout = ..2),
           se.fit = TRUE,
           type = "response"
         ) %>% as_tibble()
       ),
     # Merge that prediction and standard error with the actual baseline risk values for graphing
     cox_pred =
-      map(
-        cox_pred,
+      pmap(
+        list(cox_pred, outcome_time),
         # Bind column of predicted probabilities to
         ~ bind_cols(
           ..1,
-          tibble(preopbcr_pr5 = seq(0, 1, length.out = 100), out = 0, ttout = 15)
+          tibble(preopbcr_pr5 = seq(0, 1, length.out = 100), out = 0, ttout = ..2)
         ) %>%
           # Convert "fit" variable to event probability
           mutate(event_pr = 1 - fit)
@@ -803,10 +807,10 @@ df_bs_analysis <-
 # Save out all predictions and calculate difference
 df_bs_pred <-
   df_bs_analysis %>%
-  select(boot, rp, outcome, cox_pred) %>%
+  select(boot, rp, outcome, outcome_time, cox_pred) %>%
   unnest(cox_pred) %>%
   # Reshape to wide to calculate difference between immediate RP and delayed RP
-  select(boot, rp, outcome, preopbcr_pr5, ttout, event_pr) %>%
+  select(boot, rp, outcome, outcome_time, preopbcr_pr5, ttout, event_pr) %>%
   pivot_wider(
     names_from = "rp",
     names_prefix = "event_pr",
@@ -825,7 +829,7 @@ df_bs_final <-
   df_bs_pred %>%
   filter(boot != 0) %>%
   # Group by value of preopbcr_pr5
-  nest(df_pred = -c(outcome, preopbcr_pr5)) %>%
+  nest(df_pred = -c(outcome, outcome_time, preopbcr_pr5)) %>%
   # Standard error for bootstrap = standard deviation of difference between groups
   mutate(
     se = map_dbl(df_pred, ~ sd(..1[["event_pr_diff"]], na.rm = TRUE))
@@ -834,7 +838,7 @@ df_bs_final <-
   select(-df_pred) %>%
   left_join(
     df_centralest,
-    by = c("outcome", "preopbcr_pr5")
+    by = c("outcome", "outcome_time", "preopbcr_pr5")
   ) %>%
   mutate(
     lb = event_pr_diff - 1.96*se,
@@ -842,8 +846,8 @@ df_bs_final <-
     ub = event_pr_diff + 1.96*se,
     ub = if_else(ub > 1, 1, ub)
   ) %>%
-  select(outcome, preopbcr_pr5, event_pr_diff, lb, ub) %>%
-  nest(df_plot = -c(outcome))
+  select(outcome, outcome_time, preopbcr_pr5, event_pr_diff, lb, ub) %>%
+  nest(df_plot = -c(outcome, outcome_time))
 
 # Graph difference between groups with 95% CI                                                                    
 df_prdiff_plot <-
@@ -859,15 +863,15 @@ df_prdiff_plot <-
   # Create graph
   mutate(
     gg_prdiff =
-      map2(
-        df_plot, label,
+      pmap(
+        list(df_plot, label, outcome_time),
         ~ ggplot(..1) +
           geom_line(aes(x = preopbcr_pr5, y = event_pr_diff)) +
           geom_line(aes(x = preopbcr_pr5, y = lb), col = "gray") +
           geom_line(aes(x = preopbcr_pr5, y = ub), col = "gray") +
           labs(
             x = "Risk of BCR within 5 Years",
-            y = as.character(str_glue("Risk of {..2} within 15 Years"))
+            y = as.character(str_glue("Risk of {..2} within {..3} Years"))
           ) +
           scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
           scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1))
